@@ -37,80 +37,142 @@ use std::sync::Once;
 static LIBXSMM_INIT: Once = Once::new();
 
 // SIMD module with platform-specific implementations.
-// TODO: AVX512?
+// AVX-512 added, with AVX2 and NEON fallbacks.
 mod simd {
     #[cfg(target_arch = "x86_64")]
     use std::arch::x86_64::*;
-    
+
     #[cfg(target_arch = "aarch64")]
     use std::arch::aarch64::*;
-    
-    /// Find max w/ AVX2 and prefetching.
+
+    /// Find max using AVX-512 (16 floats per vector, 4-way ILP = 64 elements/iteration).
+    /// Falls back to AVX2 if AVX-512F isn't available at runtime.
     #[cfg(target_arch = "x86_64")]
     #[inline]
     pub fn simd_max_avx2(slice: &[f32]) -> f32 {
+        // Runtime dispatch: use AVX-512 if available
+        if is_x86_feature_detected!("avx512f") {
+            return unsafe { simd_max_avx512(slice) };
+        }
+        unsafe { simd_max_avx2_inner(slice) }
+    }
+
+    /// AVX-512F: 4x zmm (16 floats each) = 64 elements per iteration.
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx512f")]
+    unsafe fn simd_max_avx512(slice: &[f32]) -> f32 {
+        if slice.len() < 16 {
+            return slice.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        }
+
+        let mut max_vec0 = _mm512_set1_ps(f32::NEG_INFINITY);
+        let mut max_vec1 = _mm512_set1_ps(f32::NEG_INFINITY);
+        let mut max_vec2 = _mm512_set1_ps(f32::NEG_INFINITY);
+        let mut max_vec3 = _mm512_set1_ps(f32::NEG_INFINITY);
+
+        let mut i = 0;
+
+        // Process 64 elements at a time (4x16) for maximum ILP
+        while i + 64 <= slice.len() {
+            let data0 = _mm512_loadu_ps(slice.as_ptr().add(i));
+            let data1 = _mm512_loadu_ps(slice.as_ptr().add(i + 16));
+            let data2 = _mm512_loadu_ps(slice.as_ptr().add(i + 32));
+            let data3 = _mm512_loadu_ps(slice.as_ptr().add(i + 48));
+
+            max_vec0 = _mm512_max_ps(max_vec0, data0);
+            max_vec1 = _mm512_max_ps(max_vec1, data1);
+            max_vec2 = _mm512_max_ps(max_vec2, data2);
+            max_vec3 = _mm512_max_ps(max_vec3, data3);
+
+            i += 64;
+        }
+
+        // Process remaining groups of 16
+        while i + 16 <= slice.len() {
+            let data = _mm512_loadu_ps(slice.as_ptr().add(i));
+            max_vec0 = _mm512_max_ps(max_vec0, data);
+            i += 16;
+        }
+
+        // Combine 4 vectors → 1
+        max_vec0 = _mm512_max_ps(max_vec0, max_vec1);
+        max_vec2 = _mm512_max_ps(max_vec2, max_vec3);
+        max_vec0 = _mm512_max_ps(max_vec0, max_vec2);
+
+        // Horizontal max: _mm512_reduce_max_ps
+        let mut result = _mm512_reduce_max_ps(max_vec0);
+
+        // Scalar tail
+        for j in i..slice.len() {
+            result = result.max(slice[j]);
+        }
+
+        result
+    }
+
+    /// AVX2: 4x ymm (8 floats each) = 32 elements per iteration.
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2")]
+    unsafe fn simd_max_avx2_inner(slice: &[f32]) -> f32 {
         if slice.len() < 8 {
             return slice.iter().copied().fold(f32::NEG_INFINITY, f32::max);
         }
-        
-        unsafe {
-            // Use 4 vectors for better ILP (Instruction Level Parallelism)
-            let mut max_vec0 = _mm256_set1_ps(f32::NEG_INFINITY);
-            let mut max_vec1 = _mm256_set1_ps(f32::NEG_INFINITY);
-            let mut max_vec2 = _mm256_set1_ps(f32::NEG_INFINITY);
-            let mut max_vec3 = _mm256_set1_ps(f32::NEG_INFINITY);
-            
-            let mut i = 0;
-            
-            // Process 32 elements at a time (4x8) for better ILP
-            while i + 32 <= slice.len() {
-                // Prefetch next cache line
-                _mm_prefetch(slice.as_ptr().add(i + 64) as *const i8, _MM_HINT_T0);
-                
-                let data0 = _mm256_loadu_ps(slice.as_ptr().add(i));
-                let data1 = _mm256_loadu_ps(slice.as_ptr().add(i + 8));
-                let data2 = _mm256_loadu_ps(slice.as_ptr().add(i + 16));
-                let data3 = _mm256_loadu_ps(slice.as_ptr().add(i + 24));
-                
-                max_vec0 = _mm256_max_ps(max_vec0, data0);
-                max_vec1 = _mm256_max_ps(max_vec1, data1);
-                max_vec2 = _mm256_max_ps(max_vec2, data2);
-                max_vec3 = _mm256_max_ps(max_vec3, data3);
-                
-                i += 32;
-            }
-            
-            // Process remaining groups of 8
-            while i + 8 <= slice.len() {
-                let data = _mm256_loadu_ps(slice.as_ptr().add(i));
-                max_vec0 = _mm256_max_ps(max_vec0, data);
-                i += 8;
-            }
-            
-            // Combine the 4 vectors
-            max_vec0 = _mm256_max_ps(max_vec0, max_vec1);
-            max_vec2 = _mm256_max_ps(max_vec2, max_vec3);
-            max_vec0 = _mm256_max_ps(max_vec0, max_vec2);
-            
-            // Horizontal max within the final vector
-            let high = _mm256_extractf128_ps(max_vec0, 1);
-            let low = _mm256_castps256_ps128(max_vec0);
-            let max128 = _mm_max_ps(high, low);
-            
-            let shuffled = _mm_shuffle_ps(max128, max128, 0b01001110);
-            let max64 = _mm_max_ps(max128, shuffled);
-            let shuffled2 = _mm_shuffle_ps(max64, max64, 0b00000001);
-            let final_max = _mm_max_ps(max64, shuffled2);
-            
-            let mut result = _mm_cvtss_f32(final_max);
-            
-            // Handle remaining elements
-            for j in i..slice.len() {
-                result = result.max(slice[j]);
-            }
-            
-            result
+
+        let mut max_vec0 = _mm256_set1_ps(f32::NEG_INFINITY);
+        let mut max_vec1 = _mm256_set1_ps(f32::NEG_INFINITY);
+        let mut max_vec2 = _mm256_set1_ps(f32::NEG_INFINITY);
+        let mut max_vec3 = _mm256_set1_ps(f32::NEG_INFINITY);
+
+        let mut i = 0;
+
+        // Process 32 elements at a time (4x8) for better ILP
+        while i + 32 <= slice.len() {
+            // Prefetch next cache line
+            _mm_prefetch(slice.as_ptr().add(i + 64) as *const i8, _MM_HINT_T0);
+
+            let data0 = _mm256_loadu_ps(slice.as_ptr().add(i));
+            let data1 = _mm256_loadu_ps(slice.as_ptr().add(i + 8));
+            let data2 = _mm256_loadu_ps(slice.as_ptr().add(i + 16));
+            let data3 = _mm256_loadu_ps(slice.as_ptr().add(i + 24));
+
+            max_vec0 = _mm256_max_ps(max_vec0, data0);
+            max_vec1 = _mm256_max_ps(max_vec1, data1);
+            max_vec2 = _mm256_max_ps(max_vec2, data2);
+            max_vec3 = _mm256_max_ps(max_vec3, data3);
+
+            i += 32;
         }
+
+        // Process remaining groups of 8
+        while i + 8 <= slice.len() {
+            let data = _mm256_loadu_ps(slice.as_ptr().add(i));
+            max_vec0 = _mm256_max_ps(max_vec0, data);
+            i += 8;
+        }
+
+        // Combine the 4 vectors
+        max_vec0 = _mm256_max_ps(max_vec0, max_vec1);
+        max_vec2 = _mm256_max_ps(max_vec2, max_vec3);
+        max_vec0 = _mm256_max_ps(max_vec0, max_vec2);
+
+        // Horizontal max within the final vector
+        let high = _mm256_extractf128_ps(max_vec0, 1);
+        let low = _mm256_castps256_ps128(max_vec0);
+        let max128 = _mm_max_ps(high, low);
+
+        let shuffled = _mm_shuffle_ps(max128, max128, 0b01001110);
+        let max64 = _mm_max_ps(max128, shuffled);
+        let shuffled2 = _mm_shuffle_ps(max64, max64, 0b00000001);
+        let final_max = _mm_max_ps(max64, shuffled2);
+
+        let mut result = _mm_cvtss_f32(final_max);
+
+        // Handle remaining elements
+        for j in i..slice.len() {
+            result = result.max(slice[j]);
+        }
+
+        result
     }
     
     /// Find max w/ ARM NEON.
@@ -577,11 +639,34 @@ mod algorithm {
 }
 
 // libxsmm -- the true magic (feature-gated)
+//
+// Two paths:
+//   Path 1: BLAS wrapper (libxsmm_sgemm) — auto-JIT, always works
+//   Path 2: JIT dispatch (libxsmm_dispatch_gemm) — explicit JIT, zero dispatch overhead
+//
+// Path 2 is used when the block size is known ahead of time (fixed d_len).
+// Path 1 is the fallback for variable-length documents.
 #[cfg(feature = "use-libxsmm")]
 mod libxsmm {
     use super::*;
-    
-    /// Clean libxsmm implementation
+
+    /// Try to get a JIT kernel for the given block GEMM shape.
+    /// Returns None if LIBXSMM can't JIT for this shape (falls back to SGEMM).
+    fn try_jit_kernel(block_size: usize, q_len: usize, dim: usize) -> Option<libxsmm_bindings::JitKernel> {
+        // JIT dispatch works best for small, fixed shapes (M,N,K ≤ 256)
+        if block_size > 256 || q_len > 256 || dim > 4096 {
+            return None;
+        }
+        libxsmm_bindings::JitKernel::f32_gemm(
+            block_size as i32,
+            q_len as i32,
+            dim as i32,
+        )
+    }
+
+    /// Clean libxsmm implementation with JIT dispatch.
+    ///
+    /// Tries JIT dispatch first (zero per-call overhead), falls back to SGEMM.
     pub fn maxsim_libxsmm_clean(
         q: &[f32],           // [q_len * dim]
         d: &[f32],           // [n_docs * d_len * dim]
@@ -589,135 +674,153 @@ mod libxsmm {
         d_len: usize,
         dim: usize,
     ) -> Vec<f32> {
-        // Initialize libxsmm
         LIBXSMM_INIT.call_once(|| {
             unsafe { libxsmm_bindings::libxsmm_init(); }
         });
 
         let n_docs = d.len() / (d_len * dim);
-        
-        // Try to keep tiles in L2 cache  
-        let block_size = 64;
+        let block_size = 64; // L2 cache tile size
 
-        // Process documents in parallel
+        // Try JIT dispatch for the common block size
+        let jit_kernel = try_jit_kernel(block_size, q_len, dim);
+
         (0..n_docs).into_par_iter().map(|doc_idx| {
             let doc_offset = doc_idx * d_len * dim;
             let doc_data = &d[doc_offset..doc_offset + d_len * dim];
-            
-            // max values for each query
             let mut max_vals = vec![f32::NEG_INFINITY; q_len];
-            
-            // Process document tokens in blocks
+
             for t in (0..d_len).step_by(block_size) {
                 let actual_block_size = block_size.min(d_len - t);
-                
-                // Workspace for GEMM output
                 let mut c = vec![0.0f32; q_len * actual_block_size];
-                
-                // Compute Q × D_block^T using libxsmm
-                // For column-major BLAS: C = A*B computes C^T = B^T * A^T
-                // We want C = Q * D^T, so we compute C^T = D * Q^T\
-                // This was a complete mess to figure out.
-                // But it works now and it's correct.
-                unsafe {
-                    libxsmm_bindings::xsmm_sgemm(
-                        b'T',                               // transa: D block transposed
-                        b'N',                               // transb: Q not transposed
-                        actual_block_size as i32,           // M: cols of original C
-                        q_len as i32,                       // N: rows of original C
-                        dim as i32,                         // K: dimension
-                        1.0,                                // alpha
-                        doc_data.as_ptr().add(t * dim),     // A: doc block
-                        dim as i32,                         // lda
-                        q.as_ptr(),                         // B: queries
-                        dim as i32,                         // ldb
-                        0.0,                                // beta
-                        c.as_mut_ptr(),                     // C: output
-                        actual_block_size as i32,           // ldc
-                    );
-                }
-                
-                // Update max values - C is column-major from libxsmm
-                // Since we computed C^T = D * Q^T, element C[qi,ti] is at qi * actual_block_size + ti
-                for qi in 0..q_len {
-                    for ti in 0..actual_block_size {
-                        let idx = qi * actual_block_size + ti;
-                        max_vals[qi] = max_vals[qi].max(c[idx]);
+
+                // Use JIT kernel if available AND block is full-size
+                if let Some(ref kernel) = jit_kernel {
+                    if actual_block_size == block_size {
+                        unsafe {
+                            kernel.call(
+                                doc_data.as_ptr().add(t * dim) as *const libc::c_void,
+                                q.as_ptr() as *const libc::c_void,
+                                c.as_mut_ptr() as *mut libc::c_void,
+                            );
+                        }
+                    } else {
+                        // Tail block: fall back to SGEMM
+                        unsafe {
+                            libxsmm_bindings::xsmm_sgemm(
+                                b'T', b'N',
+                                actual_block_size as i32, q_len as i32, dim as i32,
+                                1.0,
+                                doc_data.as_ptr().add(t * dim), dim as i32,
+                                q.as_ptr(), dim as i32,
+                                0.0,
+                                c.as_mut_ptr(), actual_block_size as i32,
+                            );
+                        }
+                    }
+                } else {
+                    // No JIT: use BLAS wrapper
+                    unsafe {
+                        libxsmm_bindings::xsmm_sgemm(
+                            b'T', b'N',
+                            actual_block_size as i32, q_len as i32, dim as i32,
+                            1.0,
+                            doc_data.as_ptr().add(t * dim), dim as i32,
+                            q.as_ptr(), dim as i32,
+                            0.0,
+                            c.as_mut_ptr(), actual_block_size as i32,
+                        );
                     }
                 }
+
+                // Update max values with SIMD
+                for qi in 0..q_len {
+                    let base = qi * actual_block_size;
+                    let block_sims = &c[base..base + actual_block_size];
+                    max_vals[qi] = max_vals[qi].max(simd::simd_max_avx2(block_sims));
+                }
             }
-            
-            // Sum all max values
+
             max_vals.iter().sum()
         }).collect()
     }
-    
-    /// Process variable-length documents with libxsmm
+
+    /// Process variable-length documents with libxsmm.
+    /// Uses SGEMM (auto-JIT) since block sizes vary per document.
     pub fn maxsim_libxsmm_variable(
         q: &[f32],                                    // [q_len * dim]
         doc_infos: Vec<(usize, usize, &[f32])>,     // [(doc_idx, doc_len, doc_data)]
         q_len: usize,
         dim: usize,
     ) -> Vec<f32> {
-        // Initialize libxsmm
         LIBXSMM_INIT.call_once(|| {
             unsafe { libxsmm_bindings::libxsmm_init(); }
         });
-        
+
         let n_docs = doc_infos.len();
-        
-        // Process documents in parallel, each with its actual length
+        let block_size = 64;
+
+        // Try JIT for the common full-block shape
+        let jit_kernel = try_jit_kernel(block_size, q_len, dim);
+
         let mut results = vec![0.0f32; n_docs];
         let results_vec: Vec<(usize, f32)> = doc_infos.into_par_iter().map(|(doc_idx, doc_len, doc_data)| {
-            // max values for each query
             let mut max_vals = vec![f32::NEG_INFINITY; q_len];
-            
-            // Try to keep tiles in L2 cache  
-            let block_size = 64;
-            
-            // Process document tokens in blocks
+
             for t in (0..doc_len).step_by(block_size) {
                 let actual_block_size = block_size.min(doc_len - t);
-                
-                // Workspace for GEMM output
                 let mut c = vec![0.0f32; q_len * actual_block_size];
-                
-                unsafe {
-                    libxsmm_bindings::xsmm_sgemm(
-                        b'T',                               // transa: D block transposed
-                        b'N',                               // transb: Q not transposed
-                        actual_block_size as i32,           // M: cols of original C
-                        q_len as i32,                       // N: rows of original C
-                        dim as i32,                         // K: dimension
-                        1.0,                                // alpha
-                        doc_data.as_ptr().add(t * dim),     // A: doc block
-                        dim as i32,                         // lda
-                        q.as_ptr(),                         // B: queries
-                        dim as i32,                         // ldb
-                        0.0,                                // beta
-                        c.as_mut_ptr(),                     // C: output
-                        actual_block_size as i32,           // ldc
-                    );
-                }
-                
-                // Update max values
-                for qi in 0..q_len {
-                    for ti in 0..actual_block_size {
-                        let idx = qi * actual_block_size + ti;
-                        max_vals[qi] = max_vals[qi].max(c[idx]);
+
+                if let Some(ref kernel) = jit_kernel {
+                    if actual_block_size == block_size {
+                        unsafe {
+                            kernel.call(
+                                doc_data.as_ptr().add(t * dim) as *const libc::c_void,
+                                q.as_ptr() as *const libc::c_void,
+                                c.as_mut_ptr() as *mut libc::c_void,
+                            );
+                        }
+                    } else {
+                        unsafe {
+                            libxsmm_bindings::xsmm_sgemm(
+                                b'T', b'N',
+                                actual_block_size as i32, q_len as i32, dim as i32,
+                                1.0,
+                                doc_data.as_ptr().add(t * dim), dim as i32,
+                                q.as_ptr(), dim as i32,
+                                0.0,
+                                c.as_mut_ptr(), actual_block_size as i32,
+                            );
+                        }
+                    }
+                } else {
+                    unsafe {
+                        libxsmm_bindings::xsmm_sgemm(
+                            b'T', b'N',
+                            actual_block_size as i32, q_len as i32, dim as i32,
+                            1.0,
+                            doc_data.as_ptr().add(t * dim), dim as i32,
+                            q.as_ptr(), dim as i32,
+                            0.0,
+                            c.as_mut_ptr(), actual_block_size as i32,
+                        );
                     }
                 }
+
+                // Update max values with SIMD
+                for qi in 0..q_len {
+                    let base = qi * actual_block_size;
+                    let block_sims = &c[base..base + actual_block_size];
+                    max_vals[qi] = max_vals[qi].max(simd::simd_max_avx2(block_sims));
+                }
             }
-            
-            // Sum all max values
+
             (doc_idx, max_vals.iter().sum())
         }).collect();
-        
-        // Place results in correct order
+
         for (doc_idx, score) in results_vec {
             results[doc_idx] = score;
         }
-        
+
         results
     }
 }
